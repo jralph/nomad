@@ -4,33 +4,439 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/consul-template/signals"
 	hclog "github.com/hashicorp/go-hclog"
 	plugin "github.com/hashicorp/go-plugin"
-	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/client/driver/executor"
 	dstructs "github.com/hashicorp/nomad/client/driver/structs"
-	"github.com/hashicorp/nomad/helper/fields"
-	"github.com/hashicorp/nomad/helper/uuid"
+	bbase "github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers/base"
 	"github.com/hashicorp/nomad/plugins/drivers/utils"
-	"github.com/mitchellh/mapstructure"
+	"github.com/hashicorp/nomad/plugins/shared/hclspec"
+	"golang.org/x/net/context"
 )
 
-const DriverName = "raw_exec"
+const (
+	// pluginName is the name of the plugin
+	pluginName = "raw_exec"
+
+	// fingerprintPeriod is the interval at which the driver will send fingerprint responses
+	fingerprintPeriod = 30 * time.Second
+)
+
+var (
+	pluginInfo = &bbase.PluginInfoResponse{
+		Type:             bbase.PluginTypeDriver,
+		PluginApiVersion: "0.0.1",
+		PluginVersion:    "0.1.0",
+		Name:             pluginName,
+	}
+
+	configSpec = hclspec.NewObject(map[string]*hclspec.Spec{
+		"enabled": hclspec.NewDefault(
+			hclspec.NewAttr("enabled", "bool", false),
+			hclspec.NewLiteral("false"),
+		),
+		"no_cgroups": hclspec.NewDefault(
+			hclspec.NewAttr("no_cgroups", "bool", false),
+			hclspec.NewLiteral("false"),
+		),
+	})
+
+	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
+		"command": hclspec.NewAttr("command", "string", true),
+		"args":    hclspec.NewAttr("command", "list(string)", false),
+	})
+
+	capabilities = &base.Capabilities{
+		SendSignals: true,
+		Exec:        true,
+		FSIsolation: base.FSIsolationNone,
+	}
+)
 
 // The RawExecDriver is a privileged version of the exec driver. It provides no
 // resource isolation and just fork/execs. The Exec driver should be preferred
 // and this should only be used when explicitly needed.
 type RawExecDriver struct {
+	*utils.Eventer
+	config *Config
+	tasks  *taskStore
 
-	// useCgroup tracks whether we should use a cgroup to manage the process
+	// fingerprintCh is a channel which other funcs can send fingerprints to
+	// that will immediatly be sent
+	fingerprintCh chan *base.Fingerprint
+
+	stopCh chan struct{}
+
+	logger hclog.Logger
+}
+
+type Config struct {
+	// noCgroups tracks whether we should use a cgroup to manage the process
 	// tree
-	useCgroup bool
+	noCgroups bool `codec:"no_cgroups"`
 
-	tasks *taskStore
+	// enabled is set to true to enable the raw_exec driver
+	enabled bool `codec:"enabled"`
+}
+
+type TaskConfig struct {
+	Command string   `codec:"command"`
+	Args    []string `codec:"args"`
+}
+
+func NewRawExecDriver(logger hclog.Logger) base.DriverPlugin {
+	stopCh := make(chan struct{})
+	return &RawExecDriver{
+		Eventer:       utils.NewEventer(stopCh),
+		config:        &Config{},
+		tasks:         newTaskStore(),
+		fingerprintCh: make(chan *base.Fingerprint),
+		stopCh:        stopCh,
+		logger:        logger.Named(pluginName),
+	}
+}
+
+func (r *RawExecDriver) PluginInfo() (*bbase.PluginInfoResponse, error) {
+	return pluginInfo, nil
+}
+
+func (r *RawExecDriver) ConfigSchema() (*hclspec.Spec, error) {
+	return configSpec, nil
+}
+
+func (r *RawExecDriver) SetConfig(data []byte) error {
+	var config Config
+	if err := bbase.MsgPackDecode(data, &config); err != nil {
+		return err
+	}
+
+	r.config = &config
+	go r.fingerprintNow()
+	return nil
+}
+
+func (r *RawExecDriver) Shutdown(ctx context.Context) error {
+	close(r.stopCh)
+	return nil
+}
+
+func (r *RawExecDriver) TaskConfigSchema() (*hclspec.Spec, error) {
+	return taskConfigSpec, nil
+}
+
+func (r *RawExecDriver) Capabilities() (*base.Capabilities, error) {
+	return capabilities, nil
+}
+
+func (r *RawExecDriver) Fingerprint(ctx context.Context) (<-chan *base.Fingerprint, error) {
+	ch := make(chan *base.Fingerprint)
+	go r.fingerprint(ctx, ch)
+	return r.fingerprintCh, nil
+}
+
+func (r *RawExecDriver) fingerprint(ctx context.Context, ch chan *base.Fingerprint) {
+	defer close(r.fingerprintCh)
+
+	ticker := time.NewTimer(0)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ticker.Reset(fingerprintPeriod)
+			go r.fingerprintNow()
+		case f := <-r.fingerprintCh:
+			ch <- f
+		}
+	}
+}
+
+func (r *RawExecDriver) fingerprintNow() {
+	if r.fingerprintCh == nil {
+		r.logger.Debug("fingerprint channel was nil, skipping fingerprint")
+		return
+	}
+	var health base.HealthState
+	var desc string
+	if r.config.enabled {
+		health = base.HealthStateHealthy
+		desc = "raw_exec enabled"
+	} else {
+		health = base.HealthStateUnhealthy
+		desc = "raw_exec not enabled"
+	}
+	r.fingerprintCh <- &base.Fingerprint{
+		Attributes:        map[string]string{},
+		Health:            health,
+		HealthDescription: desc,
+	}
+}
+
+func (r *RawExecDriver) RecoverTask(handle *base.TaskHandle) error {
+	var taskState RawExecTaskState
+
+	err := handle.GetDriverState(&taskState)
+	if err != nil {
+		return err
+	}
+
+	pluginConfig := &plugin.ClientConfig{
+		Reattach: taskState.ReattachConfig,
+	}
+
+	exec, pluginClient, err := utils.CreateExecutorWithConfig(pluginConfig, os.Stderr)
+	if err != nil {
+		return err
+	}
+
+	h := &rawExecTaskHandle{
+		exec:         exec,
+		pid:          taskState.Pid,
+		pluginClient: pluginClient,
+		task:         taskState.TaskConfig,
+		procState:    base.TaskStateRunning,
+		startedAt:    taskState.StartedAt,
+	}
+
+	r.tasks.Set(taskState.TaskConfig.ID, h)
+
+	go h.run()
+	return nil
+}
+
+func (r *RawExecDriver) StartTask(cfg *base.TaskConfig) (*base.TaskHandle, error) {
+	if _, ok := r.tasks.Get(cfg.ID); ok {
+		return nil, fmt.Errorf("task with ID '%s' already started", cfg.ID)
+	}
+
+	var driverConfig TaskConfig
+	if err := cfg.DecodeDriverConfig(&driverConfig); err != nil {
+		return nil, err
+	}
+
+	handle := base.NewTaskHandle(pluginName)
+	handle.Config = cfg
+
+	// Get the command to be ran
+	command := driverConfig.Command
+	if err := utils.ValidateCommand(command, "args"); err != nil {
+		return nil, err
+	}
+
+	pluginLogFile := filepath.Join(cfg.TaskDir().Dir, "executor.out")
+	executorConfig := &dstructs.ExecutorConfig{
+		LogFile:  pluginLogFile,
+		LogLevel: "debug",
+	}
+
+	exec, pluginClient, err := utils.CreateExecutor(os.Stderr, hclog.Debug, 14000, 14512, executorConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	execCmd := &executor.ExecCommand{
+		Cmd:  driverConfig.Command,
+		Args: driverConfig.Args,
+		Env:  cfg.EnvList(),
+		User: cfg.User,
+		//TaskKillSignal:     os.Interrupt,
+		BasicProcessCgroup: !r.config.noCgroups,
+	}
+
+	ps, err := exec.Launch(execCmd)
+	if err != nil {
+		pluginClient.Kill()
+		return nil, err
+	}
+
+	h := &rawExecTaskHandle{
+		exec:         exec,
+		pid:          ps.Pid,
+		pluginClient: pluginClient,
+		task:         cfg,
+		procState:    base.TaskStateRunning,
+		startedAt:    time.Now(),
+	}
+
+	r.tasks.Set(cfg.ID, h)
+
+	handle.SetDriverState(RawExecTaskState{
+		ReattachConfig: pluginClient.ReattachConfig(),
+		Pid:            ps.Pid,
+		TaskConfig:     cfg,
+		StartedAt:      h.startedAt,
+	})
+
+	go h.run()
+	return handle, nil
+}
+
+func (r *RawExecDriver) WaitTask(ctx context.Context, taskID string) (<-chan *base.ExitResult, error) {
+	ch := make(chan *base.ExitResult)
+	handle, ok := r.tasks.Get(taskID)
+	if !ok {
+		return nil, base.ErrTaskNotFound
+	}
+	go r.handleWait(ctx, handle, ch)
+
+	return ch, nil
+}
+
+func (r *RawExecDriver) handleWait(ctx context.Context, handle *rawExecTaskHandle, ch chan *base.ExitResult) {
+	defer close(ch)
+	var result *base.ExitResult
+	ps, err := handle.exec.Wait()
+	if err != nil {
+		result = &base.ExitResult{
+			Err: fmt.Errorf("executor: error waiting on process: %v", err),
+		}
+	} else {
+		result = &base.ExitResult{
+			ExitCode: ps.ExitCode,
+			Signal:   ps.Signal,
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return
+	case ch <- result:
+	}
+}
+
+func (r *RawExecDriver) StopTask(taskID string, timeout time.Duration, signal string) error {
+	/*
+		handle, ok := r.tasks.Get(taskID)
+		if !ok {
+			return base.ErrTaskNotFound
+		}
+
+		//TODO executor only supports shutting down with the initial signal provided
+			if err := handle.exec.Shutdown(); err != nil {
+				if handle.pluginClient.Exited() {
+					return nil
+				}
+				return fmt.Errorf("executor Shutdown failed: %v", err)
+			}
+
+			select {
+			case <-d.WaitTask(taskID):
+				return nil
+			case <-time.After(timeout):
+				if handle.pluginClient.Exited() {
+					return nil
+				}
+				if err := handle.exec.Exit(); err != nil {
+					return fmt.Errorf("executor Exit failed: %v", err)
+				}
+				return nil
+			}*/
+	panic("not implemented")
+}
+
+func (r *RawExecDriver) DestroyTask(taskID string, force bool) error {
+	handle, ok := r.tasks.Get(taskID)
+	if !ok {
+		return base.ErrTaskNotFound
+	}
+
+	if !handle.pluginClient.Exited() {
+		if err := handle.exec.Destroy(); err != nil {
+			handle.logger.Error("destroying executor failed", "err", err)
+		}
+	}
+
+	handle.pluginClient.Kill()
+	r.tasks.Delete(taskID)
+	return nil
+}
+
+func (r *RawExecDriver) InspectTask(taskID string) (*base.TaskStatus, error) {
+	handle, ok := r.tasks.Get(taskID)
+	if !ok {
+		return nil, base.ErrTaskNotFound
+	}
+
+	status := &base.TaskStatus{
+		ID:           handle.task.ID,
+		Name:         handle.task.Name,
+		State:        handle.procState,
+		SizeOnDiskMB: 0,
+		StartedAt:    handle.startedAt,
+		CompletedAt:  handle.completedAt,
+		ExitResult:   handle.exitResult,
+		DriverAttributes: map[string]string{
+			"pid": strconv.Itoa(handle.pid),
+		},
+		NetworkOverride: &base.NetworkOverride{},
+	}
+
+	return status, nil
+}
+
+func (r *RawExecDriver) TaskStats(taskID string) (*base.TaskStats, error) {
+	handle, ok := r.tasks.Get(taskID)
+	if !ok {
+		return nil, base.ErrTaskNotFound
+	}
+
+	stats, err := handle.exec.Stats()
+	if err != nil {
+		return nil, err
+	}
+
+	return &base.TaskStats{
+		ID:                 handle.task.ID,
+		Timestamp:          stats.Timestamp,
+		AggResourceUsage:   stats.ResourceUsage,
+		ResourceUsageByPid: stats.Pids,
+	}, nil
+}
+
+func (r *RawExecDriver) SignalTask(taskID string, signal string) error {
+	handle, ok := r.tasks.Get(taskID)
+	if !ok {
+		return base.ErrTaskNotFound
+	}
+
+	sig := os.Interrupt
+	if s, ok := signals.SignalLookup[signal]; ok {
+		sig = s
+	}
+	return handle.exec.Signal(sig)
+}
+
+func (r *RawExecDriver) ExecTask(taskID string, cmd []string, timeout time.Duration) (*base.ExecTaskResult, error) {
+	if len(cmd) == 0 {
+		return nil, fmt.Errorf("error cmd must have atleast one value")
+	}
+	handle, ok := r.tasks.Get(taskID)
+	if !ok {
+		return nil, base.ErrTaskNotFound
+	}
+
+	args := []string{}
+	if len(cmd) > 1 {
+		args = cmd[1:]
+	}
+
+	out, exitCode, err := handle.exec.Exec(time.Now().Add(timeout), cmd[0], args)
+	if err != nil {
+		return nil, err
+	}
+
+	return &base.ExecTaskResult{
+		Stdout: out,
+		ExitResult: &base.ExitResult{
+			ExitCode: exitCode,
+		},
+	}, nil
 }
 
 type taskStore struct {
@@ -71,305 +477,39 @@ func (ts *taskStore) Range(f func(id string, handle *rawExecTaskHandle) bool) {
 	}
 }
 
-func NewRawExecDriver() base.Driver {
-	return &RawExecDriver{tasks: newTaskStore()}
-}
-
-func (d *RawExecDriver) Fingerprint() *base.Fingerprint {
-	return nil
-}
-
-func (d *RawExecDriver) RecoverTask(*base.TaskHandle) error {
-	return nil
-}
-
-func (d *RawExecDriver) StartTask(config *base.TaskConfig) (*base.TaskHandle, error) {
-	err := d.Validate(config.DriverConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	if config.ID == "" {
-		config.ID = uuid.Generate()
-	} else {
-		if _, ok := d.tasks.Get(config.ID); ok {
-			return nil, fmt.Errorf("task with id '%s' already exists", config.ID)
-		}
-	}
-
-	handle := base.NewTaskHandle(DriverName)
-	handle.Config = config
-
-	// TODO: Move this struct to correct package
-	var driverConfig driver.ExecDriverConfig
-	if err := mapstructure.WeakDecode(handle.Config.DriverConfig, &driverConfig); err != nil {
-		return nil, err
-	}
-
-	// Get the command to be ran
-	command := driverConfig.Command
-	if err := utils.ValidateCommand(command, "args"); err != nil {
-		return nil, err
-	}
-
-	pluginLogFile := filepath.Join(config.TaskDir().Dir, "executor.out")
-	executorConfig := &dstructs.ExecutorConfig{
-		LogFile:  pluginLogFile,
-		LogLevel: "debug",
-	}
-
-	exec, pluginClient, err := utils.CreateExecutor(os.Stderr, "debug", 14000, 14512, executorConfig)
-	if err != nil {
-		return nil, err
-	}
-	executorCtx := &executor.ExecutorContext{
-		Driver:  DriverName,
-		TaskDir: config.TaskDir().Dir,
-		LogConfig: &executor.LogConfig{
-			LogDir:        config.TaskDir().LogDir,
-			StdoutLogFile: fmt.Sprintf("%v.stdout", config.Name),
-			StderrLogFile: fmt.Sprintf("%v.stderr", config.Name),
-			MaxFiles:      10,
-			MaxFileSizeMB: 10,
-		},
-		Env:       config.EnvList(),
-		Resources: &executor.Resources{},
-	}
-	if err := exec.SetContext(executorCtx); err != nil {
-		pluginClient.Kill()
-		return nil, fmt.Errorf("failed to set executor context: %v", err)
-	}
-
-	execCmd := &executor.ExecCommand{
-		Cmd:                driverConfig.Command,
-		Args:               driverConfig.Args,
-		User:               config.User,
-		TaskKillSignal:     os.Interrupt,
-		BasicProcessCgroup: d.useCgroup,
-	}
-
-	ps, err := exec.LaunchCmd(execCmd)
-	if err != nil {
-		pluginClient.Kill()
-		return nil, err
-	}
-
-	h := &rawExecTaskHandle{
-		ps:           ps,
-		exec:         exec,
-		pluginClient: pluginClient,
-		task:         config,
-		startTime:    time.Now(),
-		procState:    base.TaskStateRunning,
-		doneCh:       make(chan struct{}),
-	}
-
-	d.tasks.Set(config.ID, h)
-
-	handle.SetDriverState(RawExecTaskState{
-		ReattachConfig:  pluginClient.ReattachConfig(),
-		ExecutorContext: executorCtx,
-		Pid:             ps.Pid,
-	})
-
-	go h.run()
-
-	return handle, nil
-}
-
 type RawExecTaskState struct {
-	ReattachConfig  *plugin.ReattachConfig
-	ExecutorContext *executor.ExecutorContext
-	Pid             int
+	ReattachConfig *plugin.ReattachConfig
+	TaskConfig     *base.TaskConfig
+	Pid            int
+	StartedAt      time.Time
 }
 
 type rawExecTaskHandle struct {
-	ps           *executor.ProcessState
 	exec         executor.Executor
+	pid          int
 	pluginClient *plugin.Client
 	task         *base.TaskConfig
-	startTime    time.Time
 	procState    base.TaskState
+	startedAt    time.Time
+	completedAt  time.Time
+	exitResult   *base.ExitResult
 	logger       hclog.Logger
-	doneCh       chan struct{}
 }
 
 func (h *rawExecTaskHandle) run() {
-	h.exec.Wait()
-	h.procState = base.TaskStateDead
-}
-
-func (d *RawExecDriver) Validate(config map[string]interface{}) error {
-	fd := &fields.FieldData{
-		Raw: config,
-		Schema: map[string]*fields.FieldSchema{
-			"command": {
-				Type:     fields.TypeString,
-				Required: true,
-			},
-			"args": {
-				Type: fields.TypeArray,
-			},
-		},
+	if h.exitResult == nil {
+		h.exitResult = &base.ExitResult{}
 	}
 
-	if err := fd.Validate(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (d *RawExecDriver) WaitTask(taskID string) chan *base.TaskResult {
-	ch := make(chan *base.TaskResult)
-	go func() {
-		defer close(ch)
-		handle, ok := d.tasks.Get(taskID)
-		if !ok {
-			ch <- &base.TaskResult{
-				Err: fmt.Errorf("no task found for id: %s", taskID),
-			}
-			return
-		}
-
-		ps, err := handle.exec.Wait()
-		if err != nil {
-			ch <- &base.TaskResult{
-				Err: fmt.Errorf("executor: error waiting on process: %v", err),
-			}
-			return
-		}
-		ch <- &base.TaskResult{
-			ExitCode: ps.ExitCode,
-			Signal:   ps.Signal,
-		}
-	}()
-	return ch
-}
-
-func (d *RawExecDriver) StopTask(taskID string, timeout time.Duration, signal string) error {
-	handle, ok := d.tasks.Get(taskID)
-	if !ok {
-		return base.ErrTaskNotFound
-	}
-
-	//TODO executor only supports shutting down with the initial signal provided
-	if err := handle.exec.ShutDown(); err != nil {
-		if handle.pluginClient.Exited() {
-			return nil
-		}
-		return fmt.Errorf("executor Shutdown failed: %v", err)
-	}
-
-	select {
-	case <-d.WaitTask(taskID):
-		return nil
-	case <-time.After(timeout):
-		if handle.pluginClient.Exited() {
-			return nil
-		}
-		if err := handle.exec.Exit(); err != nil {
-			return fmt.Errorf("executor Exit failed: %v", err)
-		}
-		return nil
-	}
-}
-func (d *RawExecDriver) DestroyTask(taskID string) {
-	handle, ok := d.tasks.Get(taskID)
-	if !ok {
+	ps, err := h.exec.Wait()
+	if err != nil {
+		h.exitResult.Err = err
+		h.procState = base.TaskStateUnknown
+		h.completedAt = time.Now()
 		return
 	}
-
-	if !handle.pluginClient.Exited() {
-		if err := handle.exec.Exit(); err != nil {
-			handle.logger.Error("killing executor failed", "err", err)
-		}
-	}
-
-	handle.pluginClient.Kill()
-	d.tasks.Delete(taskID)
-
-}
-
-func (d *RawExecDriver) ListTasks(*base.ListTasksQuery) ([]*base.TaskSummary, error) {
-	//TODO ignore query for now
-
-	tasks := []*base.TaskSummary{}
-	rangeF := func(id string, handle *rawExecTaskHandle) bool {
-		tasks = append(tasks, &base.TaskSummary{
-			ID:        id,
-			Name:      handle.task.Name,
-			State:     string(handle.procState),
-			CreatedAt: handle.startTime,
-		})
-		return false
-	}
-	d.tasks.Range(rangeF)
-
-	return tasks, nil
-}
-func (d *RawExecDriver) InspectTask(taskID string) (*base.TaskStatus, error) {
-	return nil, nil
-}
-func (d *RawExecDriver) TaskStats(taskID string) (*base.TaskStats, error) {
-	handle, ok := d.tasks.Get(taskID)
-	if !ok {
-		return nil, base.ErrTaskNotFound
-	}
-
-	eStats, err := handle.exec.Stats()
-	if err != nil {
-		return nil, err
-	}
-
-	stats := &base.TaskStats{
-		ID:        handle.task.ID,
-		Timestamp: eStats.Timestamp,
-		AggResourceUsage: base.ResourceUsage{
-			CPU: base.CPUUsage{
-				SystemMode:       eStats.ResourceUsage.CpuStats.SystemMode,
-				UserMode:         eStats.ResourceUsage.CpuStats.UserMode,
-				TotalTicks:       eStats.ResourceUsage.CpuStats.TotalTicks,
-				ThrottledPeriods: eStats.ResourceUsage.CpuStats.ThrottledPeriods,
-				ThrottledTime:    eStats.ResourceUsage.CpuStats.ThrottledTime,
-				Percent:          eStats.ResourceUsage.CpuStats.Percent,
-				Measured:         eStats.ResourceUsage.CpuStats.Measured,
-			},
-			Memory: base.MemoryUsage{
-				RSS:            eStats.ResourceUsage.MemoryStats.RSS,
-				Cache:          eStats.ResourceUsage.MemoryStats.Cache,
-				Swap:           eStats.ResourceUsage.MemoryStats.Swap,
-				MaxUsage:       eStats.ResourceUsage.MemoryStats.MaxUsage,
-				KernelUsage:    eStats.ResourceUsage.MemoryStats.KernelUsage,
-				KernelMaxUsage: eStats.ResourceUsage.MemoryStats.KernelMaxUsage,
-				Measured:       eStats.ResourceUsage.MemoryStats.Measured,
-			},
-		},
-		ResourceUsageByPid: map[string]*base.ResourceUsage{},
-	}
-
-	for pid, usage := range eStats.Pids {
-		stats.ResourceUsageByPid[pid] = &base.ResourceUsage{
-			CPU: base.CPUUsage{
-				SystemMode:       usage.CpuStats.SystemMode,
-				UserMode:         usage.CpuStats.UserMode,
-				TotalTicks:       usage.CpuStats.TotalTicks,
-				ThrottledPeriods: usage.CpuStats.ThrottledPeriods,
-				ThrottledTime:    usage.CpuStats.ThrottledTime,
-				Percent:          usage.CpuStats.Percent,
-				Measured:         usage.CpuStats.Measured,
-			},
-			Memory: base.MemoryUsage{
-				RSS:            usage.MemoryStats.RSS,
-				Cache:          usage.MemoryStats.Cache,
-				Swap:           usage.MemoryStats.Swap,
-				MaxUsage:       usage.MemoryStats.MaxUsage,
-				KernelUsage:    usage.MemoryStats.KernelUsage,
-				KernelMaxUsage: usage.MemoryStats.KernelMaxUsage,
-				Measured:       usage.MemoryStats.Measured,
-			},
-		}
-	}
-
-	return stats, nil
+	h.procState = base.TaskStateExited
+	h.exitResult.ExitCode = ps.ExitCode
+	h.exitResult.Signal = ps.Signal
+	h.completedAt = ps.Time
 }
