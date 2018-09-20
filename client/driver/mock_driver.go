@@ -414,6 +414,8 @@ func (h *mockDriverHandle) Stats() (*cstructs.TaskResourceUsage, error) {
 // run waits for the configured amount of time and then indicates the task has
 // terminated
 func (h *mockDriverHandle) run() {
+	defer close(h.waitCh)
+
 	// Setup logging output
 	if h.stdoutString != "" {
 		go h.handleLogging()
