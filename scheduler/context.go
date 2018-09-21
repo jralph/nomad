@@ -4,7 +4,7 @@ import (
 	"log"
 	"regexp"
 
-	memdb "github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/nomad/nomad/structs"
 )

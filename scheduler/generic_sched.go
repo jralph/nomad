@@ -126,6 +126,7 @@ func (s *GenericScheduler) Process(eval *structs.Evaluation) error {
 		structs.EvalTriggerNodeDrain, structs.EvalTriggerNodeUpdate,
 		structs.EvalTriggerRollingUpdate,
 		structs.EvalTriggerPeriodicJob, structs.EvalTriggerMaxPlans,
+		structs.EvalTriggerPreemption,
 		structs.EvalTriggerDeploymentWatcher, structs.EvalTriggerRetryFailedAlloc:
 	default:
 		desc := fmt.Sprintf("scheduler cannot handle '%s' evaluation reason",
