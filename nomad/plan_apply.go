@@ -176,7 +176,7 @@ func (s *Server) applyPlan(plan *structs.Plan, result *structs.PlanResult, snap 
 	}
 
 	var evals []*structs.Evaluation
-	for preemptedJobID, _ := range preemptedJobIDs {
+	for preemptedJobID := range preemptedJobIDs {
 		job, _ := s.State().JobByID(nil, preemptedJobID.Namespace, preemptedJobID.ID)
 		if job != nil {
 			eval := &structs.Evaluation{
